@@ -54,7 +54,7 @@ __FBSDID("$FreeBSD$");
 #include "acpi_if.h"
 #include "cpufreq_if.h"
 
-#include "hwpstate_intel.h"
+#include "specialreg.h"
 
 extern uint64_t	tsc_freq;
 
