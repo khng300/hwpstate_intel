@@ -41,7 +41,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/proc.h>
 #include <sys/sched.h>
 
-#include <machine/_inttypes.h>
 #include <machine/cpu.h>
 #include <machine/md_var.h>
 #include <machine/cputypes.h>
@@ -54,15 +53,11 @@ __FBSDID("$FreeBSD$");
 #include "acpi_if.h"
 #include "cpufreq_if.h"
 
+#include "hwpstate_intel_internal.h"
 #include "specialreg.h"
 
 extern uint64_t	tsc_freq;
 
-bool intel_speed_shift = true;
-SYSCTL_BOOL(_machdep, OID_AUTO, intel_speed_shift, CTLFLAG_RDTUN, &intel_speed_shift,
-    0, "Enable Intel Speed Shift (HWP)");
-
-static void	intel_hwpstate_identify(driver_t *driver, device_t parent);
 static int	intel_hwpstate_probe(device_t dev);
 static int	intel_hwpstate_attach(device_t dev);
 static int	intel_hwpstate_detach(device_t dev);
@@ -106,14 +101,8 @@ static driver_t hwpstate_intel_driver = {
 	sizeof(struct hwp_softc),
 };
 
-/*
- * NB: This must run before the est and acpi_perf module!!!!
- *
- * If a user opts in to hwp, but the CPU doesn't support it, we need to find that
- * out before est loads or else we won't be able to use est as a backup.
- */
-DRIVER_MODULE_ORDERED(hwpstate_intel, cpu, hwpstate_intel_driver,
-    hwpstate_intel_devclass, 0, 0, SI_ORDER_FIRST);
+DRIVER_MODULE(hwpstate_intel, cpu, hwpstate_intel_driver,
+    hwpstate_intel_devclass, 0, 0);
 
 static int
 intel_hwp_dump_sysctl_handler(SYSCTL_HANDLER_ARGS)
@@ -124,7 +113,8 @@ intel_hwp_dump_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	struct hwp_softc *sc;
 	uint64_t data, data2;
 	int ret;
-	uint64_t rate, mhz = 0;
+	uint64_t rate;
+	unsigned int mhz = 0;
 
 	sc = (struct hwp_softc *)arg1;
 	dev = sc->dev;
@@ -133,7 +123,7 @@ intel_hwp_dump_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	if (pc == NULL)
 		return (ENXIO);
 
-	sb = sbuf_new_for_sysctl(NULL, NULL, 1024, req);
+	sb = sbuf_new(NULL, NULL, 1024, SBUF_FIXEDLEN | SBUF_INCLUDENUL);
 	sbuf_putc(sb, '\n');
 	thread_lock(curthread);
 	sched_bind(curthread, pc->pc_cpuid);
@@ -183,7 +173,7 @@ intel_hwp_dump_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	ret = cpu_est_clockrate(pc->pc_cpuid, &rate);
 	if (ret == 0)
 		mhz = rate / 1000000;
-	sbuf_printf(sb, "\tClockrate: %" PRIu64 " mhz\n", mhz);
+	sbuf_printf(sb, "\tClockrate: %u mhz\n", mhz);
 
 	sbuf_putc(sb, '\n');
 
@@ -193,13 +183,15 @@ out:
 	thread_unlock(curthread);
 
 	ret = sbuf_finish(sb);
+	if (ret == 0)
+		ret = SYSCTL_OUT(req, sbuf_data(sb), sbuf_len(sb));
 	sbuf_delete(sb);
 
 	return (ret);
 }
 
 static inline int
-__percent_to_raw(int x)
+percent_to_raw(int x)
 {
 
 	MPASS(x <= 100 && x >= 0);
@@ -207,7 +199,7 @@ __percent_to_raw(int x)
 }
 
 static inline int
-__raw_to_percent(int x)
+raw_to_percent(int x)
 {
 
 	MPASS(x <= 0xff && x >= 0);
@@ -234,7 +226,7 @@ sysctl_epp_select(SYSCTL_HANDLER_ARGS)
 
 	rdmsr_safe(MSR_IA32_HWP_REQUEST, &requested);
 	val = (requested & IA32_HWP_REQUEST_ENERGY_PERFORMANCE_PREFERENCE) >> 24;
-	val = __raw_to_percent(val);
+	val = raw_to_percent(val);
 
 	MPASS(val >= 0 && val <= 100);
 
@@ -242,12 +234,12 @@ sysctl_epp_select(SYSCTL_HANDLER_ARGS)
 	if (ret || req->newptr == NULL)
 		goto out;
 
-	if (val < 0)
-		val = 0;
-	if (val > 100)
-		val = 100;
+	if (val > 100) {
+		ret = EINVAL;
+		goto out;
+	}
 
-	val = __percent_to_raw(val);
+	val = percent_to_raw(val);
 
 	requested &= ~IA32_HWP_REQUEST_ENERGY_PERFORMANCE_PREFERENCE;
 	requested |= val << 24;
@@ -262,28 +254,19 @@ out:
 	return (ret);
 }
 
-static void
+void
 intel_hwpstate_identify(driver_t *driver, device_t parent)
 {
 	uint32_t regs[4];
 
-	if (!intel_speed_shift)
+	if (device_find_child(parent, "hwpstate_intel", -1) != NULL)
 		return;
 
-	if (device_find_child(parent, "hwpstate_intel", -1) != NULL) {
-		intel_speed_shift = false;
+	if (cpu_vendor_id != CPU_VENDOR_INTEL)
 		return;
-	}
 
-	if (cpu_vendor_id != CPU_VENDOR_INTEL) {
-		intel_speed_shift = false;
+	if (resource_disabled("hwpstate_intel", 0))
 		return;
-	}
-
-	if (resource_disabled("hwpstate_intel", 0)) {
-		intel_speed_shift = false;
-		return;
-	}
 
 	/*
 	 * Intel SDM 14.4.1 (HWP Programming Interfaces):
@@ -294,7 +277,7 @@ intel_hwpstate_identify(driver_t *driver, device_t parent)
 	 */
 
 	if (cpu_high < 6)
-		goto out;
+		return;
 
 	/*
 	 * Intel SDM 14.4.1 (HWP Programming Interfaces):
@@ -306,58 +289,21 @@ intel_hwpstate_identify(driver_t *driver, device_t parent)
 
 	do_cpuid(6, regs);
 	if ((regs[0] & CPUTPM1_HWP) == 0)
-		goto out;
+		return;
 
 	if (BUS_ADD_CHILD(parent, 10, "hwpstate_intel", -1) == NULL)
-		goto out;
+		return;
 
-	device_printf(parent, "hwpstate registered");
-	return;
-
-out:
-	device_printf(parent, "Speed Shift unavailable. Falling back to est\n");
-	intel_speed_shift = false;
+	if (bootverbose)
+		device_printf(parent, "hwpstate registered\n");
 }
 
 static int
 intel_hwpstate_probe(device_t dev)
 {
-	device_t perf_dev;
-	int ret, type;
-
-	/*
-	 * It is currently impossible for conflicting cpufreq driver to be loaded at
-	 * this point since it's protected by the boolean intel_speed_shift.
-	 * However, if at some point the knobs are made a bit more robust to
-	 * control cpufreq, or, at some point INFO_ONLY drivers are permitted,
-	 * this should make sure things work properly.
-	 *
-	 * IOW: This is a no-op for now.
-	 */
-	perf_dev = device_find_child(device_get_parent(dev), "acpi_perf", -1);
-	if (perf_dev && device_is_attached(perf_dev)) {
-		ret= CPUFREQ_DRV_TYPE(perf_dev, &type);
-		if (ret == 0) {
-			if ((type & CPUFREQ_FLAG_INFO_ONLY) == 0) {
-				device_printf(dev, "Avoiding acpi_perf\n");
-				return (ENXIO);
-			}
-		}
-	}
-
-	perf_dev = device_find_child(device_get_parent(dev), "est", -1);
-	if (perf_dev && device_is_attached(perf_dev)) {
-		ret= CPUFREQ_DRV_TYPE(perf_dev, &type);
-		if (ret == 0) {
-			if ((type & CPUFREQ_FLAG_INFO_ONLY) == 0) {
-				device_printf(dev, "Avoiding EST\n");
-				return (ENXIO);
-			}
-		}
-	}
 
 	device_set_desc(dev, "Intel Speed Shift");
-	return (BUS_PROBE_DEFAULT);
+	return (BUS_PROBE_NOWILDCARD);
 }
 
 /* FIXME: Need to support PKG variant */
@@ -435,12 +381,6 @@ intel_hwpstate_attach(device_t dev)
 	struct hwp_softc *sc;
 	uint32_t regs[4];
 	int ret;
-
-	KASSERT(device_find_child(device_get_parent(dev), "est", -1) == NULL,
-	    ("EST driver already loaded"));
-
-	KASSERT(device_find_child(device_get_parent(dev), "acpi_perf", -1) == NULL,
-	    ("ACPI driver already loaded"));
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
